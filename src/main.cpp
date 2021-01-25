@@ -15,28 +15,67 @@
 
 #define WEIGHTLESSTRESHOLD 1.0 // The treshold for when we asume weightlessness in m/s^2
 #define INFLIGHTTRESHOLD 30    // The treshold for when we asume device has left the ramp in m/s^2
+#define LANDEDTRESHOLD 15      // The treshold for when we asume device is landed (laying still) in m/s^2
+
+// Startup
+#define STARTUPDELAY 10000     // Time before closing servo on startup
+// Led delay at diferent states (in ms)
+#define LEDSTATE0 500
+#define LEDSTATE1 250
+#define LEDSTATE2 125
+
+// States
+#define STARTUP 0
+#define WAITINGFORLAUNCH 1
+#define INFLIGHT 2
+#define LANDED 3
 /* #endregion */
 
 /* #region  Global variables */
-unsigned long nextChange = 0; //LED Control
-
 // Flight variables
-bool top = false;
-bool inFlight = false;
+int state = STARTUP;
+bool top = false;      // True after max altitude is reached
 unsigned int startTime;
 unsigned int topTime;
 int landedCounter = 0;
 /* #endregion */
 
-/* #region  Global functions */
-// Check if devie is weightless
-bool isWeightless(float sum)
-{
-  if (sum <= WEIGHTLESSTRESHOLD)
-  {
-    return true;
+/* #region  LED global variables and functions */
+unsigned long nextChange = 0; //LED Control
+int ledDelay = LEDSTATE0;          // Delay between led change
+int ledState = 0;             // Current state of LED
+// Change led delay
+void changeLedDelay(int newDelay) {
+  nextChange = millis() + newDelay;
+  ledDelay = newDelay;
+}
+void setLedState(int newState) {
+  if (newState != ledState) {
+    ledState = newState;
+    switch (ledState) {
+      case 0:
+        changeLedDelay(LEDSTATE0);
+        break;
+      case 1:
+        changeLedDelay(LEDSTATE1);
+        break;
+      case 2:
+        changeLedDelay(LEDSTATE2);
+        break;
+    }
   }
-  return false;
+}
+// Update LED
+void updateLed() {
+  if (nextChange <= millis())
+  {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    nextChange = nextChange + ledDelay;
+  }
+}
+// Set LED to off
+void ledOFF() {
+  digitalWrite(LED_BUILTIN, LOW);
 }
 /* #endregion */
 
@@ -70,12 +109,6 @@ void beginAccel()
       ;
   }
 }
-// Get event
-sensors_event_t getEvent()
-{
-  sensors_event_t event;
-  accel.getEvent(&event);
-}
 // Get sum of forces
 float getSum(sensors_event_t event)
 {
@@ -101,6 +134,98 @@ void logEvent(sensors_event_t event)
 }
 /* #endregion */
 
+/* #region  BMP085 global variables and functions */
+double startPressure;
+double altitude;
+/* #endregion */
+
+/* #region  Global functions */
+// Check if devie is weightless
+bool isWeightless(float sum)
+{
+  if (sum <= WEIGHTLESSTRESHOLD)
+  {
+    return true;
+  }
+  return false;
+}
+// Runs in flight
+void runInFlight() {
+  //Runs while device in inflight
+  unsigned int functionStart = millis(); // Keeps track of when function started
+  
+  // Get a new ADXL345 sensor event
+  sensors_event_t event;
+  accel.getEvent(&event);
+  float sum = getSum(event);
+  
+  // Check if we reached maximum altitude
+  if (sum < WEIGHTLESSTRESHOLD && !top) {
+    topTime = functionStart - startTime; // Caluculate time since launch
+    //altitude = bmp.readAltitude(startPressure); // TODO: Measure height
+    top = true;
+    Serial.println("Releasing parachute");
+    myservo.write(SERVORELEASE);
+  }
+
+  /* TODO log variables
+  serialRadio.print(functionStart - startTime);
+  serialRadio.print("\t");
+  serialRadio.print(x);
+  serialRadio.print("\t");
+  serialRadio.print(y);
+  serialRadio.print("\t");
+  serialRadio.print(z);
+  serialRadio.print("\t");
+  serialRadio.println(sum);
+  */
+
+  // If acceleration is less than LANDEDTRESHOLD for 20 iterations we asume that we have landed
+  if (landedCounter < 20 && sum < LANDEDTRESHOLD) {
+    landedCounter++;
+  } else if (landedCounter >= 20 && sum < LANDEDTRESHOLD) {
+    state = LANDED;
+    landedCounter = 0;
+    top = false;
+    /* TODO: log max height and end log
+    serialRadio.print("Rocket reached a topheight of ");
+    serialRadio.print(altitude);
+    serialRadio.print("m at ");
+    serialRadio.print(topTime);
+    serialRadio.println("ms");
+    serialRadio.println("E");
+    */
+  } else if (sum > LANDEDTRESHOLD) {
+    landedCounter = 0;
+  }
+
+  // Calculate how much delay is needed to keep constant update rate
+  long int functionTime = millis() - functionStart; // Calculate execution time of function
+  int remainingDelay = 50 - functionTime;
+  // Only delay if function took less than 50ms
+  if (remainingDelay > 0) {
+    delay(remainingDelay);
+  }
+}
+// Runs while waiting to be launched
+void waitForLaunch() {
+  // Get a new ADXL345 sensor event
+  sensors_event_t event;
+  accel.getEvent(&event);
+  float sum = getSum(event);
+
+  // Wait until the device hits acceleration defined as INFLIGHTTRESHOLD
+  if (sum > INFLIGHTTRESHOLD) {
+    //serialRadio.println("S"); // TODO: start log
+    state = INFLIGHT;           // Set device to inFligt mode
+    startTime = millis();       // Save time of launch
+    ledOFF();                   // Turn led off
+  } else {
+    delay(50); // Device was not launched, so we wait
+  }
+}
+/* #endregion */
+
 // the setup function runs once when you press reset or power the board
 void setup()
 {
@@ -115,29 +240,51 @@ void setup()
   // Set the range of accelerometer to +-16G
   accel.setRange(ADXL345_RANGE_16_G);
 
+  // Set servo to relased position
+  myservo.write(SERVORELEASE);
+
   Serial.println("Started");
 }
 
 // the loop function runs over and over again forever
 void loop()
 {
-  // Get a new ADXL345 sensor event
-  sensors_event_t event = getEvent();
-  float sum = getSum(event);
-
-  // Check if device is weightless (at the top of arch)
-  if (isWeightless(sum))
-  {
-    activateServo();
+  switch (state) {
+    case STARTUP: {
+      delay(50);
+      updateLed();
+      
+      unsigned int curTime = millis();
+      if (curTime > STARTUPDELAY) {
+        changeLedDelay(1000);
+        myservo.write(SERVOHOME);
+        state = WAITINGFORLAUNCH;
+      } else if (curTime > (STARTUPDELAY/3)*2) {
+        setLedState(2);
+      } else if (curTime > (STARTUPDELAY/3)) {
+        setLedState(1);
+      } else {
+        setLedState(0);
+      }
+      break;
+    }
+    case WAITINGFORLAUNCH: {
+      updateLed();
+      waitForLaunch();
+      break;
+    }
+    case INFLIGHT: {
+      runInFlight();
+      break;
+    }
+    case LANDED: {
+      Serial.println("We are landed! TODO: Add some way to retrieve log");
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      delay(500);
+      break;
+    }
   }
 
-  // Update LED and log current sensor data
-  if (nextChange <= millis())
-  {
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-    logEvent(event);
-    nextChange = nextChange + 1000;
-  }
-
-  delay(100);
+  //Serial.print("State: "); Serial.print(state); Serial.print("  ");
+  //Serial.print("LED State: ");  Serial.println(ledState);
 }
