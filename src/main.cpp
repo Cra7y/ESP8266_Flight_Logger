@@ -1,11 +1,13 @@
 /* #region  Includes */
 #include <Arduino.h> // Include main arduino lib
+#include <SPI.h>
 
 // Include other libs
 #include <servo.h> // Servo
 #include <Wire.h>  // I2C
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
+#include <Adafruit_BMP085.h>
 /* #endregion */
 
 /* #region  Defines */
@@ -29,15 +31,27 @@
 #define WAITINGFORLAUNCH 1
 #define INFLIGHT 2
 #define LANDED 3
+#define RUNDEBUG 4
 /* #endregion */
 
 /* #region  Global variables */
 // Flight variables
-int state = STARTUP;
+#ifdef DEBUG
+  int state = RUNDEBUG;
+#else
+  int state = STARTUP;
+#endif
 bool top = false;      // True after max altitude is reached
 unsigned int startTime;
 unsigned int topTime;
 int landedCounter = 0;
+
+// Log
+const int sizeI = 1200;
+const int sizeJ = 5;
+float flightLog[sizeI][sizeJ];
+int logCursor = 0;
+bool logOverflow = false;
 /* #endregion */
 
 /* #region  LED global variables and functions */
@@ -135,6 +149,7 @@ void logEvent(sensors_event_t event)
 /* #endregion */
 
 /* #region  BMP085 global variables and functions */
+Adafruit_BMP085 bmp;
 double startPressure;
 double altitude;
 /* #endregion */
@@ -162,23 +177,23 @@ void runInFlight() {
   // Check if we reached maximum altitude
   if (sum < WEIGHTLESSTRESHOLD && !top) {
     topTime = functionStart - startTime; // Caluculate time since launch
-    //altitude = bmp.readAltitude(startPressure); // TODO: Measure height
+    altitude = bmp.readAltitude(startPressure); // Measure max height
     top = true;
     Serial.println("Releasing parachute");
     myservo.write(SERVORELEASE);
   }
 
-  /* TODO log variables
-  serialRadio.print(functionStart - startTime);
-  serialRadio.print("\t");
-  serialRadio.print(x);
-  serialRadio.print("\t");
-  serialRadio.print(y);
-  serialRadio.print("\t");
-  serialRadio.print(z);
-  serialRadio.print("\t");
-  serialRadio.println(sum);
-  */
+  // Log acceleration variables
+  if (logCursor < sizeI) {
+    flightLog[logCursor][0] = functionStart - startTime;  // Time since launch
+    flightLog[logCursor][1] = event.acceleration.x;       // Acceleration X
+    flightLog[logCursor][2] = event.acceleration.y;       // Acceleration X
+    flightLog[logCursor][3] = event.acceleration.z;       // Acceleration X
+    flightLog[logCursor][4] = sum;                        // Acceleration resulting force
+    logCursor++;
+  } else {
+    logOverflow = true;
+  }
 
   // If acceleration is less than LANDEDTRESHOLD for 20 iterations we asume that we have landed
   if (landedCounter < 20 && sum < LANDEDTRESHOLD) {
@@ -187,7 +202,7 @@ void runInFlight() {
     state = LANDED;
     landedCounter = 0;
     top = false;
-    /* TODO: log max height and end log
+    /* TODO: log max height and end log (Compile log)
     serialRadio.print("Rocket reached a topheight of ");
     serialRadio.print(altitude);
     serialRadio.print("m at ");
@@ -195,6 +210,21 @@ void runInFlight() {
     serialRadio.println("ms");
     serialRadio.println("E");
     */
+    Serial.println("Log");
+    for (int i = 0; i < sizeI; i++) {
+      if (flightLog[i][0] == 0.0) {
+        break;
+      }
+      Serial.print("Time: "); Serial.print(flightLog[i][0]); Serial.print("ms ");
+      Serial.print("X: "); Serial.print(flightLog[i][1]); Serial.print(" ");
+      Serial.print("Y: "); Serial.print(flightLog[i][2]); Serial.print(" ");
+      Serial.print("Z: "); Serial.print(flightLog[i][3]); Serial.print(" ");
+      Serial.print("SUM: "); Serial.print(flightLog[i][4]); Serial.print(" ");
+      Serial.println("m/s^2 ");
+    }
+    Serial.print("Rocket reached a topheight of "); Serial.print(altitude); Serial.print("m at "); Serial.print(topTime); Serial.println("ms");
+    Serial.println("End of log");
+    
   } else if (sum > LANDEDTRESHOLD) {
     landedCounter = 0;
   }
@@ -216,7 +246,6 @@ void waitForLaunch() {
 
   // Wait until the device hits acceleration defined as INFLIGHTTRESHOLD
   if (sum > INFLIGHTTRESHOLD) {
-    //serialRadio.println("S"); // TODO: start log
     state = INFLIGHT;           // Set device to inFligt mode
     startTime = millis();       // Save time of launch
     ledOFF();                   // Turn led off
@@ -233,6 +262,7 @@ void setup()
   myservo.attach(SERVOPIN); // attaches the servo on pin 2 (D4) to the servo object
   Serial.begin(115200);     // Start serial
   beginAccel();             // Start accelerometer
+  bmp.begin();              // Start barometer
 
   // Setup pins
   pinMode(LED_BUILTIN, OUTPUT); // initialize digital pin LED_BUILTIN as an output.
@@ -244,6 +274,10 @@ void setup()
   myservo.write(SERVORELEASE);
 
   Serial.println("Started");
+
+  if (state == RUNDEBUG) {
+    //startPressure = bmp.readPressure();
+  }
 }
 
 // the loop function runs over and over again forever
@@ -258,6 +292,7 @@ void loop()
       if (curTime > STARTUPDELAY) {
         changeLedDelay(1000);
         myservo.write(SERVOHOME);
+        startPressure = bmp.readPressure(); // Measure start pressure (Needed to calculate relative preasure later)
         state = WAITINGFORLAUNCH;
       } else if (curTime > (STARTUPDELAY/3)*2) {
         setLedState(2);
@@ -282,6 +317,22 @@ void loop()
       digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
       delay(500);
       break;
+    }
+    case RUNDEBUG: {
+      Serial.print("Temperature = ");
+      Serial.print(bmp.readTemperature());
+      Serial.println(" Celsius");
+ 
+      Serial.print("Pressure = ");
+      Serial.print(bmp.readPressure());
+      Serial.println(" Pascal");
+
+      Serial.print("Altitude = ");
+      Serial.print(bmp.readAltitude(startPressure));
+      Serial.println(" Meters");
+ 
+      Serial.println();
+      delay(5000);
     }
   }
 
